@@ -12,6 +12,7 @@
   "license": "ISC",
   "dependencies": {
     "@distube/ytdl-core": "^4.16.4",
+    "@mrnima/tiktok-downloader": "^1.0.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "fb-video-downloader": "^1.0.3",
@@ -19,6 +20,7 @@
     "instagram-private-api": "^1.46.1",
     "mongoose": "^8.10.1",
     "node-fetch": "^3.3.2",
+    "ruhend-scraper": "^8.1.0",
     "telegraf": "^4.16.3",
     "ytdl-core": "^4.11.5"
   },

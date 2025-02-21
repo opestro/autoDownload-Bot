@@ -12,6 +12,7 @@ import InstagramHandler from './instagram-handler.js'; // Import Instagram handl
 import User from './models/user.js'; // Import User model
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
+import { ttdl, ytmp3, ytmp4, fbdl, igdl } from 'ruhend-scraper'; // Import ruhend-scraper functions
 
 const app = express();
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN); // Use the token from config
@@ -85,153 +86,139 @@ function getUrlType(url) {
     if (tiktokRegex.test(url)) return 'tiktok';
     return 'unknown';
 }
-
-// Handle video downloads
+// Handle YouTube downloads
 async function downloadYouTubeVideo(url, ctx) {
     let videoPath = null;
     
     try {
         console.log('Starting download process for URL:', url);
 
-        // Validate YouTube URL
         if (!ytdl.validateURL(url)) {
             throw new Error('Invalid YouTube URL');
         }
 
-        // Get video info
-        console.log('Fetching video info...');
         const info = await ytdl.getInfo(url);
-        console.log('Video info retrieved:', info.videoDetails.title);
+        const videoTitle = info.videoDetails.title;
 
-        // Send initial status message
-        const statusMessage = await ctx.reply('Starting video download... 0%');
+        // Ask user to choose format
+        const formatKeyboard = {
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: '🎵 MP3 (Audio)', callback_data: 'mp3' },
+                        { text: '🎬 MP4 (Video)', callback_data: 'mp4' }
+                    ]
+                ]
+            }
+        };
 
-        // Choose format
-        const format = ytdl.chooseFormat(info.formats, { 
-            quality: 'highest',
-            filter: 'audioandvideo'
-        });
+        await ctx.reply('Choose format:', formatKeyboard);
 
-        if (!format) {
-            throw new Error('No suitable format found');
-        }
-
-        console.log('Selected format:', format.qualityLabel, format.container);
-
-        const videoTitle = info.videoDetails.title.replace(/[^\w\s]/gi, '');
-        videoPath = path.join(__dirname, 'downloads', `${videoTitle}.${format.container}`);
-
-        // Create downloads directory if it doesn't exist
-        if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
-            fs.mkdirSync(path.join(__dirname, 'downloads'));
-        }
-
-        // Download the video
-        const videoStream = ytdl(url, {
-            format: format,
-            filter: 'audioandvideo'
-        });
-
-        // Track last update time to avoid too frequent updates
-        let lastUpdateTime = Date.now();
-
-        // Add progress tracking
-        videoStream.on('progress', async (chunkLength, downloaded, total) => {
-            const now = Date.now();
-            // Update status message every 2 seconds
-            if (now - lastUpdateTime > 2000) {
-                const percent = (downloaded / total * 100).toFixed(1);
-                try {
-                    // Send a new message for the progress update
-                    await ctx.reply(`Downloading: ${percent}%`);
-                    lastUpdateTime = now;
-                } catch (err) {
-                    console.error('Error sending progress message:', err);
+        // Handle format selection
+        bot.action('mp3', async (ctx) => {
+            try {
+                await ctx.editMessageText('⏳ Processing audio...');
+                const audioPath = path.join(__dirname, 'downloads', `${videoTitle}.mp3`);
+                
+                if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
+                    fs.mkdirSync(path.join(__dirname, 'downloads'));
                 }
+
+                const audioStream = ytdl(url, { filter: 'audioonly' });
+                const writeStream = fs.createWriteStream(audioPath);
+
+                writeStream.on('finish', async () => {
+                    await ctx.reply('🎵 Sending audio...');
+                    await ctx.replyWithAudio({ 
+                        source: audioPath,
+                        caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
+                    });
+                    fs.unlinkSync(audioPath);
+                    await ctx.reply('✅ Done!');
+                });
+
+                audioStream.pipe(writeStream);
+            } catch (error) {
+                console.error('Error:', error);
+                await ctx.reply('❌ Failed to process audio');
             }
         });
 
-        return new Promise((resolve, reject) => {
-            const writeStream = fs.createWriteStream(videoPath);
-            
-            writeStream.on('finish', async () => {
-                console.log('Download completed successfully.');
-                try {
-                    // Update status message
-                    await ctx.reply('Download complete! Uploading to Telegram...');
+        bot.action('mp4', async (ctx) => {
+            try {
+                const formats = ytdl.filterFormats(info.formats, 'videoandaudio');
+                const qualityOptions = formats.map((format, index) => ({
+                    text: `${format.qualityLabel} ${format.container}`,
+                    callback_data: `quality_${index}`
+                }));
 
-                    // Send video to Telegram
-                    const sentMessage = await ctx.replyWithVideo({ 
-                        source: videoPath,
-                        caption: `${info.videoDetails.title}\n\nRequested by: @${ctx.from.username || ctx.from.id}`
+                const qualityKeyboard = {
+                    reply_markup: {
+                        inline_keyboard: qualityOptions.map(option => [option])
+                    }
+                };
+
+                await ctx.editMessageText('Select video quality:', qualityKeyboard);
+
+                // Handle quality selection
+                qualityOptions.forEach((option, index) => {
+                    bot.action(`quality_${index}`, async (ctx) => {
+                        try {
+                            await ctx.editMessageText('⏳ Processing video...');
+                            const format = formats[index];
+                            const videoPath = path.join(__dirname, 'downloads', `${videoTitle}.${format.container}`);
+
+                            if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
+                                fs.mkdirSync(path.join(__dirname, 'downloads'));
+                            }
+
+                            const videoStream = ytdl(url, { format });
+                            const writeStream = fs.createWriteStream(videoPath);
+
+                            writeStream.on('finish', async () => {
+                                await ctx.reply('🎬 Sending video...');
+                                await ctx.replyWithVideo({ 
+                                    source: videoPath,
+                                    caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
+                                });
+                                fs.unlinkSync(videoPath);
+                                await ctx.reply('✅ Done!');
+                            });
+
+                            videoStream.pipe(writeStream);
+                        } catch (error) {
+                            console.error('Error:', error);
+                            await ctx.reply('❌ Failed to process video');
+                        }
                     });
-
-                    // Clean up: delete the local file
-                    fs.unlinkSync(videoPath);
-                    console.log('Local video file deleted after sending.');
-
-                    // Update final status
-                    await ctx.reply('✅ Video successfully uploaded to Telegram!');
-                    
-                    resolve(sentMessage);
-                } catch (error) {
-                    console.error('Error sending video:', error);
-                    reject(error);
-                }
-            });
-
-            writeStream.on('error', (error) => {
-                console.error('Error writing file:', error);
-                reject(error);
-            });
-
-            videoStream.pipe(writeStream);
+                });
+            } catch (error) {
+                console.error('Error:', error);
+                await ctx.reply('❌ Failed to get video qualities');
+            }
         });
 
     } catch (error) {
-        console.error('Error in downloadYouTubeVideo:', error);
-        
-        // Clean up if file exists
-        if (videoPath && fs.existsSync(videoPath)) {
-            try {
-                fs.unlinkSync(videoPath);
-                console.log('Cleaned up incomplete download file.');
-            } catch (cleanupError) {
-                console.error('Error cleaning up file:', cleanupError);
-            }
-        }
-
-        let errorMessage = 'Sorry, there was an error downloading the video. ';
-        if (error.message.includes('Invalid YouTube URL')) {
-            errorMessage += 'Please make sure you provided a valid YouTube URL.';
-        } else if (error.message.includes('No suitable format found')) {
-            errorMessage += 'Could not find a suitable video format.';
-        } else {
-            errorMessage += 'Please try again later or try a different video.';
-        }
-        
-        await ctx.reply(errorMessage);
-        throw error;
+        console.error('Error:', error);
+        await ctx.reply('❌ Invalid YouTube link');
     }
 }
-
-// Facebook video download function
 async function downloadFacebookVideo(url, ctx) {
     try {
-        await ctx.reply('Fetching Facebook video information...');
-        
-        console.log('Fetching video info for URL:', url); // Log the URL being fetched
-        const videoInfo = await fbvid.getInfo(url);
-        
-        console.log('Video Info:', videoInfo); // Log the video info response
+        console.log('Starting Facebook download process for URL:', url);
 
-        const videoUrl = videoInfo.download.hd || videoInfo.download.sd;
-        
-        if (!videoUrl) {
-            throw new Error('No downloadable video URL found');
+        const res = await fbdl(url);
+        const data = res.data;
+
+        if (!data) {
+            throw new Error('Failed to download Facebook video');
         }
 
-        const videoTitle = `fb_video_${Date.now()}`;
+        console.log('Facebook video info retrieved:', data);
+
+        // Assuming the first video in the data array is the one we want
+        const videoUrl = data[0].url; // Adjust based on the actual structure of the response
+        const videoTitle = `facebook_video_${Date.now()}`;
         const videoPath = path.join(__dirname, 'downloads', `${videoTitle}.mp4`);
 
         // Create downloads directory if it doesn't exist
@@ -239,8 +226,13 @@ async function downloadFacebookVideo(url, ctx) {
             fs.mkdirSync(path.join(__dirname, 'downloads'));
         }
 
-        // Download video using fetch
+        // Download the video file
         const response = await fetch(videoUrl);
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch video: ${response.status} ${response.statusText}`);
+        }
+
         const buffer = await response.buffer();
         fs.writeFileSync(videoPath, buffer);
 
@@ -248,29 +240,70 @@ async function downloadFacebookVideo(url, ctx) {
         await ctx.reply('Video downloaded! Sending it to you...');
         await ctx.replyWithVideo({ source: videoPath });
 
-        // Save download record to database
-        const user = await User.findOne({ telegramId: ctx.from.id });
-        if (user) {
-            user.downloads.push(url);
-            await user.save();
-        }
-
         // Clean up: delete the video file
         fs.unlinkSync(videoPath);
+        console.log('Local video file deleted after sending.');
 
     } catch (error) {
         console.error('Error downloading Facebook video:', error);
-        ctx.reply('Sorry, there was an error downloading the Facebook video. Please make sure the video is public and try again.');
+        await ctx.reply(`Sorry, there was an error downloading the Facebook video: ${error.message}`);
     }
 }
 
+// Handle Instagram downloads
+async function downloadInstagramVideo(url, ctx) {
+    try {
+        console.log('Starting Instagram download process for URL:', url);
+
+        const res = await igdl(url);
+        const data = await res.data;
+
+        if (!data || data.length === 0) {
+            throw new Error('Failed to download Instagram video');
+        }
+
+        console.log('Instagram video info retrieved:', data);
+
+        // Assuming the first media in the data array is the one we want
+        const videoUrl = data[0].url; // Adjust based on the actual structure of the response
+        const videoTitle = `instagram_video_${Date.now()}`;
+        const videoPath = path.join(__dirname, 'downloads', `${videoTitle}.mp4`);
+
+        // Create downloads directory if it doesn't exist
+        if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
+            fs.mkdirSync(path.join(__dirname, 'downloads'));
+        }
+
+        // Download the video file
+        const response = await fetch(videoUrl);
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch video: ${response.status} ${response.statusText}`);
+        }
+
+        const buffer = await response.buffer();
+        fs.writeFileSync(videoPath, buffer);
+
+        // Send video to user
+        await ctx.reply('Video downloaded! Sending it to you...');
+        await ctx.replyWithVideo({ source: videoPath });
+
+        // Clean up: delete the video file
+        fs.unlinkSync(videoPath);
+        console.log('Local video file deleted after sending.');
+
+    } catch (error) {
+        console.error('Error downloading Instagram video:', error);
+        await ctx.reply(`Sorry, there was an error downloading the Instagram video: ${error.message}`);
+    }
+}
 // LinkedIn video download function
 async function downloadLinkedInVideo(url, ctx) {
     try {
         await ctx.reply('Fetching LinkedIn video information...');
-        
+
         const videoIdInfo = getVideoId(url);
-        
+
         if (!videoIdInfo || videoIdInfo.service !== 'linkedin') {
             throw new Error('Invalid LinkedIn video URL');
         }
@@ -318,28 +351,21 @@ async function downloadLinkedInVideo(url, ctx) {
     }
 }
 
-// TikTok video download function
+// Handle TikTok downloads
 async function downloadTikTokVideo(url, ctx) {
     try {
-        await ctx.reply('Fetching TikTok video information...');
+        console.log('Starting TikTok download process for URL:', url);
 
-        const videoIdInfo = getVideoId(url);
-        
-        if (!videoIdInfo || videoIdInfo.service !== 'tiktok') {
-            throw new Error('Invalid TikTok video URL');
+        // Download TikTok video
+        const data = await ttdl(url);
+
+        if (!data) {
+            throw new Error('Failed to download TikTok video');
         }
 
-        // Here you would need to implement the logic to fetch the video using the videoId
-        // Since we cannot directly download TikTok videos, you may need to use an API or another method
+        console.log('TikTok video info retrieved:', data.title);
 
-        // For demonstration, let's assume we have a function to get the video URL
-        const videoUrl = await fetchTikTokVideoUrl(videoIdInfo.id); // Placeholder function
-
-        if (!videoUrl) {
-            throw new Error('No downloadable video URL found');
-        }
-
-        const videoTitle = `tiktok_video_${Date.now()}`;
+        const videoTitle = data.title.replace(/[^\w\s]/gi, '');
         const videoPath = path.join(__dirname, 'downloads', `${videoTitle}.mp4`);
 
         // Create downloads directory if it doesn't exist
@@ -347,8 +373,14 @@ async function downloadTikTokVideo(url, ctx) {
             fs.mkdirSync(path.join(__dirname, 'downloads'));
         }
 
-        // Download video using fetch
+        // Download the video file
+        const videoUrl = data.video; // Use the video link from the response
         const response = await fetch(videoUrl);
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch video: ${response.status} ${response.statusText}`);
+        }
+
         const buffer = await response.buffer();
         fs.writeFileSync(videoPath, buffer);
 
@@ -356,21 +388,16 @@ async function downloadTikTokVideo(url, ctx) {
         await ctx.reply('Video downloaded! Sending it to you...');
         await ctx.replyWithVideo({ source: videoPath });
 
-        // Save download record to database
-        const user = await User.findOne({ telegramId: ctx.from.id });
-        if (user) {
-            user.downloads.push(url);
-            await user.save();
-        }
-
         // Clean up: delete the video file
         fs.unlinkSync(videoPath);
+        console.log('Local video file deleted after sending.');
 
     } catch (error) {
         console.error('Error downloading TikTok video:', error);
-        ctx.reply('Sorry, there was an error downloading the TikTok video. Please make sure the video is public and try again.');
+        await ctx.reply(`Sorry, there was an error downloading the TikTok video: ${error.message}`);
     }
 }
+
 
 // Update the text message handler
 bot.on('text', async (ctx) => {
@@ -399,7 +426,7 @@ bot.on('text', async (ctx) => {
                 await ctx.reply('Processing your YouTube video download request...');
                 await downloadYouTubeVideo(messageText, ctx);
                 break;
-            
+
             case 'facebook':
                 await ctx.reply('Processing your Facebook video download request...');
                 await downloadFacebookVideo(messageText, ctx);
@@ -437,11 +464,11 @@ app.post('/instagram', async (req, res) => {
 bot.command('connect_instagram', async (ctx) => {
     try {
         await ctx.reply('Please send your Instagram username to connect your account.');
-        
+
         // Set up a listener for the next message
         bot.on('text', async (innerCtx) => {
             const instagramUsername = innerCtx.message.text;
-            
+
             // Update user record with Instagram ID
             const user = await User.findOneAndUpdate(
                 { telegramId: innerCtx.from.id },
@@ -464,7 +491,7 @@ bot.command('connect_instagram', async (ctx) => {
 async function startInstagramPolling() {
     try {
         await instagramHandler.login();
-        
+
         // Poll for new messages every minute
         setInterval(async () => {
             await instagramHandler.handleDirectMessages(bot);
@@ -492,12 +519,12 @@ async function start() {
     try {
         await bot.launch();
         await startInstagramPolling();
-        
+
         // Start Express server
         app.listen(config.PORT, () => {
             console.log(`Server is running on port ${config.PORT}`);
         });
-        
+
         console.log('Bot, Instagram handler, and Express server are running');
     } catch (error) {
         console.error('Error starting services:', error);
