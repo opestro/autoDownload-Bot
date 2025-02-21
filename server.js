@@ -42,45 +42,29 @@ if (!fs.existsSync(path.join(__dirname, 'logs'))) {
     fs.mkdirSync(path.join(__dirname, 'logs'));
 }
 
-// Enhanced logging function with more detailed information
+// Enhanced logging function
 function log(level, message, data = null) {
     const timestamp = new Date().toISOString();
-    let logEntry = `${timestamp} - ${level}`;
-
-    // Add process ID and user info if available
-    if (process.pid) {
-        logEntry += ` [PID:${process.pid}]`;
-    }
-
-    logEntry += ` - ${message}`;
+    let logEntry = `${timestamp} - ${level} - ${message}`;
     
     // Add data if provided
     if (data) {
+        // If data is an error object, get the stack trace
         if (data instanceof Error) {
-            logEntry += `\nError: ${data.message}\nStack Trace: ${data.stack}`;
+            logEntry += `\nStack Trace: ${data.stack}`;
         } else {
-            try {
-                const dataString = JSON.stringify(data, null, 2);
-                logEntry += `\nData: ${dataString}`;
-            } catch (err) {
-                logEntry += `\nData: [Unable to stringify data: ${err.message}]`;
-            }
+            // Safely stringify objects, limiting their size
+            const dataString = JSON.stringify(data, null, 2).substring(0, 1000);
+            logEntry += `\nData: ${dataString}`;
         }
     }
     
     logEntry += '\n';
 
-    // Write to file with error handling
-    try {
-        fs.appendFileSync(logFilePath, logEntry, 'utf8');
-    } catch (err) {
-        console.error('Failed to write to log file:', err);
-        // Attempt to write to a backup log file
-        const backupLogPath = path.join(__dirname, 'logs', 'backup.log');
-        fs.appendFileSync(backupLogPath, logEntry, 'utf8');
-    }
+    // Write to file
+    fs.appendFileSync(logFilePath, logEntry, 'utf8');
     
-    // Console output in development
+    // Also log to console in development
     if (process.env.NODE_ENV !== 'production') {
         console.log(logEntry);
     }
@@ -185,12 +169,7 @@ async function downloadYouTubeVideo(url, ctx) {
     let videoPath = null;
     
     try {
-        logger.info('Starting download process', {
-            url,
-            userId: ctx.from?.id,
-            username: ctx.from?.username,
-            chatId: ctx.chat?.id
-        });
+        logger.info(`Starting download process for URL: ${url}`);
 
         if (!ytdl.validateURL(url)) {
             logger.warning('Invalid YouTube URL attempted', { url });
@@ -201,13 +180,7 @@ async function downloadYouTubeVideo(url, ctx) {
         logger.debug('Video info retrieved', {
             title: info.videoDetails.title,
             duration: info.videoDetails.lengthSeconds,
-            author: info.videoDetails.author,
-            formats: info.formats.map(f => ({
-                quality: f.qualityLabel,
-                container: f.container,
-                hasAudio: f.hasAudio,
-                hasVideo: f.hasVideo
-            }))
+            author: info.videoDetails.author
         });
 
         const videoTitle = info.videoDetails.title;
@@ -307,7 +280,7 @@ async function downloadYouTubeVideo(url, ctx) {
 
                 // Create quality options
                 const qualityOptions = sortedFormats.map((format, index) => ({
-                    text: `📺 ${format.qualityLabel || format.quality}${format.hasAudio ? '' : ' (no audio)'}`,
+                    text: `📺 ${format.qualityLabel || format.quality}${format.hasAudio ? '' : ' (audio merged)'}`,
                     callback_data: `quality_${index}`
                 }));
 
@@ -327,6 +300,7 @@ async function downloadYouTubeVideo(url, ctx) {
                             const format = sortedFormats[index];
                             const videoPath = path.join(__dirname, 'downloads', `${videoTitle}.${format.container}`);
                             const audioPath = path.join(__dirname, 'downloads', `${videoTitle}.mp3`);
+                            const mergedVideoPath = path.join(__dirname, 'downloads', `${videoTitle}_merged.mp4`); // Temporary output path for merged video
 
                             if (format.hasAudio) {
                                 // If format has audio, download directly
@@ -369,23 +343,26 @@ async function downloadYouTubeVideo(url, ctx) {
                                     // Merge audio and video
                                     ffmpeg(videoPath)
                                         .addInput(audioPath)
-                                        .outputOptions('-c:v copy') // Copy video codec
-                                        .outputOptions('-c:a aac') // Encode audio to AAC
+                                        .outputOptions('-c:v libx264') // Use H.264 codec for video
+                                        .outputOptions('-c:a aac') // Use AAC codec for audio
+                                        .outputOptions('-b:a 192k') // Set audio bitrate
+                                        .outputOptions('-preset fast') // Use a fast preset for encoding
+                                        .save(mergedVideoPath) // Save the merged file to a different path
                                         .on('end', async () => {
                                             await ctx.reply('🎬 Sending merged video...');
                                             await ctx.replyWithVideo({ 
-                                                source: videoPath,
+                                                source: mergedVideoPath,
                                                 caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
                                             });
-                                            fs.unlinkSync(videoPath);
+                                            fs.unlinkSync(videoPath); // Clean up video file
                                             fs.unlinkSync(audioPath); // Clean up audio file
+                                            fs.unlinkSync(mergedVideoPath); // Clean up merged video file
                                             await ctx.reply('✅ Done!');
                                         })
                                         .on('error', (error) => {
                                             logger.error('Error merging video and audio', error);
                                             ctx.reply('❌ Failed to process video');
-                                        })
-                                        .save(videoPath); // Save the merged file
+                                        });
                                 });
                             }
                         } catch (error) {
@@ -745,41 +722,35 @@ export default downloadYouTubeVideo;
 
 // Update error handling
 process.on('uncaughtException', (error) => {
-    logger.error('Uncaught Exception', {
-        error,
-        stack: error.stack
-    });
+    logger.error('Uncaught Exception', error);
     process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     logger.error('Unhandled Rejection', {
         reason,
-        promise: promise.toString()
+        promise
     });
 });
 
-// Log rotation with more detailed information
+// Example log rotation (to prevent log files from growing too large)
 function rotateLogFile() {
     try {
         if (fs.existsSync(logFilePath)) {
             const stats = fs.statSync(logFilePath);
             const fileSizeInMB = stats.size / (1024 * 1024);
             
-            if (fileSizeInMB > 10) {
+            if (fileSizeInMB > 10) { // Rotate when file size exceeds 10MB
                 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
                 const newPath = `${logFilePath}.${timestamp}`;
                 fs.renameSync(logFilePath, newPath);
-                logger.info('Log file rotated', {
-                    oldSize: `${fileSizeInMB.toFixed(2)}MB`,
-                    newPath
-                });
+                logger.info('Log file rotated');
             }
         }
     } catch (error) {
-        logger.error('Log rotation failed', error);
+        console.error('Error rotating log file:', error);
     }
 }
 
-// More frequent log rotation checks (every 30 minutes)
-setInterval(rotateLogFile, 30 * 60 * 1000);
+// Check log file size every hour
+setInterval(rotateLogFile, 60 * 60 * 1000);
