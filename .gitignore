@@ -1,3 +1,4 @@
 .env
 README (3).md
 /node_modules
+package-lock.json
