@@ -142,10 +142,11 @@ async function downloadYouTubeVideo(url, ctx) {
             if (now - lastUpdateTime > 2000) {
                 const percent = (downloaded / total * 100).toFixed(1);
                 try {
-                    await statusMessage.edit(`Downloading: ${percent}%`);
+                    // Send a new message for the progress update
+                    await ctx.reply(`Downloading: ${percent}%`);
                     lastUpdateTime = now;
                 } catch (err) {
-                    console.error('Error updating status message:', err);
+                    console.error('Error sending progress message:', err);
                 }
             }
         });
@@ -157,7 +158,7 @@ async function downloadYouTubeVideo(url, ctx) {
                 console.log('Download completed successfully.');
                 try {
                     // Update status message
-                    await statusMessage.edit('Download complete! Uploading to Telegram...');
+                    await ctx.reply('Download complete! Uploading to Telegram...');
 
                     // Send video to Telegram
                     const sentMessage = await ctx.replyWithVideo({ 
@@ -170,7 +171,7 @@ async function downloadYouTubeVideo(url, ctx) {
                     console.log('Local video file deleted after sending.');
 
                     // Update final status
-                    await statusMessage.edit('✅ Video successfully uploaded to Telegram!');
+                    await ctx.reply('✅ Video successfully uploaded to Telegram!');
                     
                     resolve(sentMessage);
                 } catch (error) {
