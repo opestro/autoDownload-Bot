@@ -22,7 +22,18 @@ const ig = new IgApiClient();
 const instagramHandler = new InstagramHandler();
 
 // MongoDB connection
-mongoose.connect(config.MONGODB_URI);
+mongoose.connect(config.MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 5000, // Try to connect for 5 seconds
+    socketTimeoutMS: 10000, // Close sockets after 45 seconds of inactivity
+})
+.then(() => {
+    console.log('MongoDB connected successfully');
+})
+.catch(err => {
+    console.error('MongoDB connection error:', err);
+});
 
 // Cookie rotation pool
 const cookiePool = [];
@@ -98,6 +109,7 @@ async function downloadYouTubeVideo(url, ctx) {
         }
 
         const info = await ytdl.getInfo(url);
+        console.log(info)
         const videoTitle = info.videoDetails.title;
 
         // Ask user to choose format
@@ -105,8 +117,8 @@ async function downloadYouTubeVideo(url, ctx) {
             reply_markup: {
                 inline_keyboard: [
                     [
-                        { text: '🎵 MP3 (Audio)', callback_data: 'mp3' },
-                        { text: '🎬 MP4 (Video)', callback_data: 'mp4' }
+                        { text: '🎵 Audio Only', callback_data: 'audio' },
+                        { text: '🎬 Video + Audio', callback_data: 'videoaudio' }
                     ]
                 ]
             }
@@ -114,17 +126,20 @@ async function downloadYouTubeVideo(url, ctx) {
 
         await ctx.reply('Choose format:', formatKeyboard);
 
-        // Handle format selection
-        bot.action('mp3', async (ctx) => {
+        // Handle audio only selection
+        bot.action('audio', async (ctx) => {
             try {
                 await ctx.editMessageText('⏳ Processing audio...');
+                
+                // Get highest quality audio
+                const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio' });
                 const audioPath = path.join(__dirname, 'downloads', `${videoTitle}.mp3`);
                 
                 if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
                     fs.mkdirSync(path.join(__dirname, 'downloads'));
                 }
 
-                const audioStream = ytdl(url, { filter: 'audioonly' });
+                const audioStream = ytdl(url, { format });
                 const writeStream = fs.createWriteStream(audioPath);
 
                 writeStream.on('finish', async () => {
@@ -144,11 +159,22 @@ async function downloadYouTubeVideo(url, ctx) {
             }
         });
 
-        bot.action('mp4', async (ctx) => {
+        // Handle video selection
+        bot.action('videoaudio', async (ctx) => {
             try {
+                // Get formats with both video and audio
                 const formats = ytdl.filterFormats(info.formats, 'videoandaudio');
-                const qualityOptions = formats.map((format, index) => ({
-                    text: `${format.qualityLabel} ${format.container}`,
+                
+                // Sort formats by quality (highest to lowest)
+                const sortedFormats = formats.sort((a, b) => {
+                    const aQuality = parseInt(a.qualityLabel);
+                    const bQuality = parseInt(b.qualityLabel);
+                    return bQuality - aQuality;
+                });
+
+                // Create quality options
+                const qualityOptions = sortedFormats.map((format, index) => ({
+                    text: `📺 ${format.qualityLabel} - ${format.container}`,
                     callback_data: `quality_${index}`
                 }));
 
@@ -165,7 +191,7 @@ async function downloadYouTubeVideo(url, ctx) {
                     bot.action(`quality_${index}`, async (ctx) => {
                         try {
                             await ctx.editMessageText('⏳ Processing video...');
-                            const format = formats[index];
+                            const format = sortedFormats[index];
                             const videoPath = path.join(__dirname, 'downloads', `${videoTitle}.${format.container}`);
 
                             if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
