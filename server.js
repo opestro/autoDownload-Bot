@@ -13,6 +13,8 @@ import User from './models/user.js'; // Import User model
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
 import { ttdl, ytmp3, ytmp4, fbdl, igdl } from 'ruhend-scraper'; // Import ruhend-scraper functions
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegPath from 'ffmpeg-static';
 
 const app = express();
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN); // Use the token from config
@@ -20,6 +22,80 @@ const ig = new IgApiClient();
 
 // Initialize Instagram handler
 const instagramHandler = new InstagramHandler();
+
+// Define __dirname for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Logging configuration
+const LOG_LEVELS = {
+    INFO: 'INFO',
+    ERROR: 'ERROR',
+    DEBUG: 'DEBUG',
+    WARNING: 'WARNING'
+};
+
+const logFilePath = path.join(__dirname, 'logs', 'app.log');
+
+// Ensure logs directory exists
+if (!fs.existsSync(path.join(__dirname, 'logs'))) {
+    fs.mkdirSync(path.join(__dirname, 'logs'));
+}
+
+// Enhanced logging function with more detailed information
+function log(level, message, data = null) {
+    const timestamp = new Date().toISOString();
+    let logEntry = `${timestamp} - ${level}`;
+
+    // Add process ID and user info if available
+    if (process.pid) {
+        logEntry += ` [PID:${process.pid}]`;
+    }
+
+    logEntry += ` - ${message}`;
+    
+    // Add data if provided
+    if (data) {
+        if (data instanceof Error) {
+            logEntry += `\nError: ${data.message}\nStack Trace: ${data.stack}`;
+        } else {
+            try {
+                const dataString = JSON.stringify(data, null, 2);
+                logEntry += `\nData: ${dataString}`;
+            } catch (err) {
+                logEntry += `\nData: [Unable to stringify data: ${err.message}]`;
+            }
+        }
+    }
+    
+    logEntry += '\n';
+
+    // Write to file with error handling
+    try {
+        fs.appendFileSync(logFilePath, logEntry, 'utf8');
+    } catch (err) {
+        console.error('Failed to write to log file:', err);
+        // Attempt to write to a backup log file
+        const backupLogPath = path.join(__dirname, 'logs', 'backup.log');
+        fs.appendFileSync(backupLogPath, logEntry, 'utf8');
+    }
+    
+    // Console output in development
+    if (process.env.NODE_ENV !== 'production') {
+        console.log(logEntry);
+    }
+}
+
+// Utility functions for different log levels
+const logger = {
+    info: (message, data = null) => log(LOG_LEVELS.INFO, message, data),
+    error: (message, error = null) => log(LOG_LEVELS.ERROR, message, error),
+    debug: (message, data = null) => log(LOG_LEVELS.DEBUG, message, data),
+    warning: (message, data = null) => log(LOG_LEVELS.WARNING, message, data)
+};
+
+// Set the path for ffmpeg
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 // MongoDB connection
 mongoose.connect(config.MONGODB_URI, {
@@ -29,19 +105,15 @@ mongoose.connect(config.MONGODB_URI, {
     socketTimeoutMS: 10000, // Close sockets after 45 seconds of inactivity
 })
 .then(() => {
-    console.log('MongoDB connected successfully');
+    logger.info('MongoDB connected successfully');
 })
 .catch(err => {
-    console.error('MongoDB connection error:', err);
+    logger.error('MongoDB connection error', err);
 });
 
 // Cookie rotation pool
 const cookiePool = [];
 let currentCookieIndex = 0;
-
-// Fix for __dirname in ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 async function getNextCookie() {
     try {
@@ -59,7 +131,7 @@ async function getNextCookie() {
         currentCookieIndex = (currentCookieIndex + 1) % cookiePool.length;
         return cookie;
     } catch (error) {
-        console.error('Error in cookie rotation:', error);
+        logger.error('Error in cookie rotation', error);
         return null;
     }
 }
@@ -74,7 +146,7 @@ async function getYouTubeCookies() {
         });
         return response.headers.get('set-cookie');
     } catch (error) {
-        console.error('Error fetching cookies:', error);
+        logger.error('Error fetching cookies', error);
         return null;
     }
 }
@@ -97,19 +169,47 @@ function getUrlType(url) {
     if (tiktokRegex.test(url)) return 'tiktok';
     return 'unknown';
 }
+
+// Logging function
+function logMessage(message) {
+    const timestamp = new Date().toISOString();
+    const logEntry = `${timestamp} - ${message}\n`;
+    fs.appendFileSync(logFilePath, logEntry, 'utf8');
+}
+
+// Example usage of the logging function
+logMessage('Server started');
+
 // Handle YouTube downloads
 async function downloadYouTubeVideo(url, ctx) {
     let videoPath = null;
     
     try {
-        console.log('Starting download process for URL:', url);
+        logger.info('Starting download process', {
+            url,
+            userId: ctx.from?.id,
+            username: ctx.from?.username,
+            chatId: ctx.chat?.id
+        });
 
         if (!ytdl.validateURL(url)) {
+            logger.warning('Invalid YouTube URL attempted', { url });
             throw new Error('Invalid YouTube URL');
         }
 
         const info = await ytdl.getInfo(url);
-        console.log(info)
+        logger.debug('Video info retrieved', {
+            title: info.videoDetails.title,
+            duration: info.videoDetails.lengthSeconds,
+            author: info.videoDetails.author,
+            formats: info.formats.map(f => ({
+                quality: f.qualityLabel,
+                container: f.container,
+                hasAudio: f.hasAudio,
+                hasVideo: f.hasVideo
+            }))
+        });
+
         const videoTitle = info.videoDetails.title;
 
         // Ask user to choose format
@@ -129,17 +229,27 @@ async function downloadYouTubeVideo(url, ctx) {
         // Handle audio only selection
         bot.action('audio', async (ctx) => {
             try {
-                await ctx.editMessageText('⏳ Processing audio...');
+                logger.info('Audio format selected', {
+                    userId: ctx.from?.id,
+                    videoTitle
+                });
                 
-                // Get highest quality audio
-                const format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio' });
+                await ctx.editMessageText('⏳ Processing audio...');
+                const audioFormat = ytdl.chooseFormat(info.formats, { quality: 'highestaudio' });
+                
+                logger.debug('Selected audio format', {
+                    format: audioFormat.qualityLabel,
+                    container: audioFormat.container,
+                    bitrate: audioFormat.audioBitrate
+                });
+
                 const audioPath = path.join(__dirname, 'downloads', `${videoTitle}.mp3`);
                 
                 if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
                     fs.mkdirSync(path.join(__dirname, 'downloads'));
                 }
 
-                const audioStream = ytdl(url, { format });
+                const audioStream = ytdl(url, { format: audioFormat });
                 const writeStream = fs.createWriteStream(audioPath);
 
                 writeStream.on('finish', async () => {
@@ -154,7 +264,7 @@ async function downloadYouTubeVideo(url, ctx) {
 
                 audioStream.pipe(writeStream);
             } catch (error) {
-                console.error('Error:', error);
+                logger.error('Audio processing failed', error);
                 await ctx.reply('❌ Failed to process audio');
             }
         });
@@ -162,19 +272,42 @@ async function downloadYouTubeVideo(url, ctx) {
         // Handle video selection
         bot.action('videoaudio', async (ctx) => {
             try {
-                // Get formats with both video and audio
-                const formats = ytdl.filterFormats(info.formats, 'videoandaudio');
+                logger.info('Video format selection started', {
+                    userId: ctx.from?.id,
+                    videoTitle
+                });
+
+                // Get both video-only and video+audio formats
+                const formats = info.formats.filter(format => format.hasVideo);
                 
-                // Sort formats by quality (highest to lowest)
-                const sortedFormats = formats.sort((a, b) => {
-                    const aQuality = parseInt(a.qualityLabel);
-                    const bQuality = parseInt(b.qualityLabel);
+                // Group formats by quality and prefer formats with audio
+                const qualityMap = new Map();
+                formats.forEach(format => {
+                    const quality = format.qualityLabel || format.quality;
+                    if (!qualityMap.has(quality) || format.hasAudio) {
+                        qualityMap.set(quality, format);
+                    }
+                });
+
+                // Convert to array and sort by quality
+                const sortedFormats = Array.from(qualityMap.values()).sort((a, b) => {
+                    const aQuality = parseInt(a.qualityLabel) || 0;
+                    const bQuality = parseInt(b.qualityLabel) || 0;
                     return bQuality - aQuality;
+                });
+
+                logger.debug('Available video formats after sorting', {
+                    formats: sortedFormats.map(f => ({
+                        quality: f.qualityLabel || f.quality,
+                        container: f.container,
+                        hasAudio: f.hasAudio,
+                        hasVideo: f.hasVideo
+                    }))
                 });
 
                 // Create quality options
                 const qualityOptions = sortedFormats.map((format, index) => ({
-                    text: `📺 ${format.qualityLabel} - ${format.container}`,
+                    text: `📺 ${format.qualityLabel || format.quality}${format.hasAudio ? '' : ' (no audio)'}`,
                     callback_data: `quality_${index}`
                 }));
 
@@ -193,42 +326,90 @@ async function downloadYouTubeVideo(url, ctx) {
                             await ctx.editMessageText('⏳ Processing video...');
                             const format = sortedFormats[index];
                             const videoPath = path.join(__dirname, 'downloads', `${videoTitle}.${format.container}`);
+                            const audioPath = path.join(__dirname, 'downloads', `${videoTitle}.mp3`);
 
-                            if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
-                                fs.mkdirSync(path.join(__dirname, 'downloads'));
-                            }
+                            if (format.hasAudio) {
+                                // If format has audio, download directly
+                                const videoStream = ytdl(url, { format });
+                                const writeStream = fs.createWriteStream(videoPath);
 
-                            const videoStream = ytdl(url, { format });
-                            const writeStream = fs.createWriteStream(videoPath);
-
-                            writeStream.on('finish', async () => {
-                                await ctx.reply('🎬 Sending video...');
-                                await ctx.replyWithVideo({ 
-                                    source: videoPath,
-                                    caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
+                                writeStream.on('finish', async () => {
+                                    await ctx.reply('🎬 Sending video...');
+                                    await ctx.replyWithVideo({ 
+                                        source: videoPath,
+                                        caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
+                                    });
+                                    fs.unlinkSync(videoPath);
+                                    await ctx.reply('✅ Done!');
                                 });
-                                fs.unlinkSync(videoPath);
-                                await ctx.reply('✅ Done!');
-                            });
 
-                            videoStream.pipe(writeStream);
+                                videoStream.pipe(writeStream);
+                            } else {
+                                // If no audio, get best audio and merge
+                                const audioFormat = ytdl.chooseFormat(info.formats, { 
+                                    quality: 'highestaudio',
+                                    filter: 'audioonly'
+                                });
+
+                                const videoStream = ytdl(url, { format });
+                                const audioStream = ytdl(url, { format: audioFormat });
+
+                                // Download video and audio streams
+                                const videoWriteStream = fs.createWriteStream(videoPath);
+                                const audioWriteStream = fs.createWriteStream(audioPath);
+
+                                videoStream.pipe(videoWriteStream);
+                                audioStream.pipe(audioWriteStream);
+
+                                // Wait for both streams to finish
+                                Promise.all([
+                                    new Promise((resolve) => videoWriteStream.on('finish', resolve)),
+                                    new Promise((resolve) => audioWriteStream.on('finish', resolve))
+                                ]).then(() => {
+                                    // Merge audio and video
+                                    ffmpeg(videoPath)
+                                        .addInput(audioPath)
+                                        .outputOptions('-c:v copy') // Copy video codec
+                                        .outputOptions('-c:a aac') // Encode audio to AAC
+                                        .on('end', async () => {
+                                            await ctx.reply('🎬 Sending merged video...');
+                                            await ctx.replyWithVideo({ 
+                                                source: videoPath,
+                                                caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
+                                            });
+                                            fs.unlinkSync(videoPath);
+                                            fs.unlinkSync(audioPath); // Clean up audio file
+                                            await ctx.reply('✅ Done!');
+                                        })
+                                        .on('error', (error) => {
+                                            logger.error('Error merging video and audio', error);
+                                            ctx.reply('❌ Failed to process video');
+                                        })
+                                        .save(videoPath); // Save the merged file
+                                });
+                            }
                         } catch (error) {
-                            console.error('Error:', error);
+                            logger.error('Error processing video', error);
                             await ctx.reply('❌ Failed to process video');
                         }
                     });
                 });
             } catch (error) {
-                console.error('Error:', error);
+                logger.error('Video format selection failed', error);
                 await ctx.reply('❌ Failed to get video qualities');
             }
         });
 
     } catch (error) {
-        console.error('Error:', error);
+        logger.error('Download process failed', {
+            error: error.message,
+            url,
+            userId: ctx.from?.id
+        });
         await ctx.reply('❌ Invalid YouTube link');
     }
 }
+
 async function downloadFacebookVideo(url, ctx) {
     try {
         console.log('Starting Facebook download process for URL:', url);
@@ -323,6 +504,7 @@ async function downloadInstagramVideo(url, ctx) {
         await ctx.reply(`Sorry, there was an error downloading the Instagram video: ${error.message}`);
     }
 }
+
 // LinkedIn video download function
 async function downloadLinkedInVideo(url, ctx) {
     try {
@@ -473,7 +655,7 @@ bot.on('text', async (ctx) => {
         }
 
     } catch (error) {
-        console.error('Error processing message:', error);
+        logger.error('Error processing message', error);
         await ctx.reply('Sorry, something went wrong. Please try again.');
     }
 });
@@ -548,15 +730,56 @@ async function start() {
 
         // Start Express server
         app.listen(config.PORT, () => {
-            console.log(`Server is running on port ${config.PORT}`);
+            logger.info(`Server started on port ${config.PORT}`);
         });
 
         console.log('Bot, Instagram handler, and Express server are running');
     } catch (error) {
-        console.error('Error starting services:', error);
+        logger.error('Error starting services', error);
     }
 }
 
 start();
 
 export default downloadYouTubeVideo;
+
+// Update error handling
+process.on('uncaughtException', (error) => {
+    logger.error('Uncaught Exception', {
+        error,
+        stack: error.stack
+    });
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('Unhandled Rejection', {
+        reason,
+        promise: promise.toString()
+    });
+});
+
+// Log rotation with more detailed information
+function rotateLogFile() {
+    try {
+        if (fs.existsSync(logFilePath)) {
+            const stats = fs.statSync(logFilePath);
+            const fileSizeInMB = stats.size / (1024 * 1024);
+            
+            if (fileSizeInMB > 10) {
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                const newPath = `${logFilePath}.${timestamp}`;
+                fs.renameSync(logFilePath, newPath);
+                logger.info('Log file rotated', {
+                    oldSize: `${fileSizeInMB.toFixed(2)}MB`,
+                    newPath
+                });
+            }
+        }
+    } catch (error) {
+        logger.error('Log rotation failed', error);
+    }
+}
+
+// More frequent log rotation checks (every 30 minutes)
+setInterval(rotateLogFile, 30 * 60 * 1000);
