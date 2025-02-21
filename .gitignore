@@ -4,3 +4,5 @@ README (3).md
 package-lock.json
 README (1).md
 logs/app.log
+/downloads
+/logs
