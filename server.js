@@ -280,7 +280,7 @@ async function downloadYouTubeVideo(url, ctx) {
 
                 // Create quality options
                 const qualityOptions = sortedFormats.map((format, index) => ({
-                    text: `📺 ${format.qualityLabel || format.quality}${format.hasAudio ? '' : ' (audio merged)'}`,
+                    text: `📺 ${format.qualityLabel || format.quality}${format.hasAudio ? ' (audio native)' : ' (audio merged - takes longer)'}`,
                     callback_data: `quality_${index}`
                 }));
 
@@ -298,76 +298,108 @@ async function downloadYouTubeVideo(url, ctx) {
                         try {
                             await ctx.editMessageText('⏳ Processing video...');
                             const format = sortedFormats[index];
-                            const videoPath = path.join(__dirname, 'downloads', `${videoTitle}.${format.container}`);
-                            const audioPath = path.join(__dirname, 'downloads', `${videoTitle}.mp3`);
-                            const mergedVideoPath = path.join(__dirname, 'downloads', `${videoTitle}_merged.mp4`); // Temporary output path for merged video
+                            
+                            // Create temporary file paths
+                            const tempVideoPath = path.join(__dirname, 'downloads', `${videoTitle}_temp_video.mp4`);
+                            const tempAudioPath = path.join(__dirname, 'downloads', `${videoTitle}_temp_audio.mp3`);
+                            const mergedVideoPath = path.join(__dirname, 'downloads', `${videoTitle}_merged.mp4`);
 
+                            // Ensure downloads directory exists
+                            if (!fs.existsSync(path.join(__dirname, 'downloads'))) {
+                                fs.mkdirSync(path.join(__dirname, 'downloads'));
+                            }
+
+                            // If format already has audio, just download and send
                             if (format.hasAudio) {
-                                // If format has audio, download directly
                                 const videoStream = ytdl(url, { format });
-                                const writeStream = fs.createWriteStream(videoPath);
+                                const writeStream = fs.createWriteStream(mergedVideoPath);
 
                                 writeStream.on('finish', async () => {
                                     await ctx.reply('🎬 Sending video...');
                                     await ctx.replyWithVideo({ 
-                                        source: videoPath,
+                                        source: mergedVideoPath,
                                         caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
                                     });
-                                    fs.unlinkSync(videoPath);
+                                    fs.unlinkSync(mergedVideoPath);
                                     await ctx.reply('✅ Done!');
                                 });
 
                                 videoStream.pipe(writeStream);
                             } else {
-                                // If no audio, get best audio and merge
+                                // Get best audio format
                                 const audioFormat = ytdl.chooseFormat(info.formats, { 
                                     quality: 'highestaudio',
                                     filter: 'audioonly'
                                 });
 
-                                const videoStream = ytdl(url, { format });
-                                const audioStream = ytdl(url, { format: audioFormat });
-
-                                // Download video and audio streams
-                                const videoWriteStream = fs.createWriteStream(videoPath);
-                                const audioWriteStream = fs.createWriteStream(audioPath);
-
-                                videoStream.pipe(videoWriteStream);
-                                audioStream.pipe(audioWriteStream);
-
-                                // Wait for both streams to finish
-                                Promise.all([
-                                    new Promise((resolve) => videoWriteStream.on('finish', resolve)),
-                                    new Promise((resolve) => audioWriteStream.on('finish', resolve))
-                                ]).then(() => {
-                                    // Merge audio and video
-                                    ffmpeg(videoPath)
-                                        .addInput(audioPath)
-                                        .outputOptions('-c:v libx264') // Use H.264 codec for video
-                                        .outputOptions('-c:a aac') // Use AAC codec for audio
-                                        .outputOptions('-b:a 192k') // Set audio bitrate
-                                        .outputOptions('-preset fast') // Use a fast preset for encoding
-                                        .save(mergedVideoPath) // Save the merged file to a different path
-                                        .on('end', async () => {
-                                            await ctx.reply('🎬 Sending merged video...');
-                                            await ctx.replyWithVideo({ 
-                                                source: mergedVideoPath,
-                                                caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
-                                            });
-                                            fs.unlinkSync(videoPath); // Clean up video file
-                                            fs.unlinkSync(audioPath); // Clean up audio file
-                                            fs.unlinkSync(mergedVideoPath); // Clean up merged video file
-                                            await ctx.reply('✅ Done!');
-                                        })
-                                        .on('error', (error) => {
-                                            logger.error('Error merging video and audio', error);
-                                            ctx.reply('❌ Failed to process video');
-                                        });
+                                // Download video and audio separately
+                                await new Promise((resolve, reject) => {
+                                    ytdl(url, { format })
+                                        .pipe(fs.createWriteStream(tempVideoPath))
+                                        .on('finish', resolve)
+                                        .on('error', reject);
                                 });
+
+                                await new Promise((resolve, reject) => {
+                                    ytdl(url, { format: audioFormat })
+                                        .pipe(fs.createWriteStream(tempAudioPath))
+                                        .on('finish', resolve)
+                                        .on('error', reject);
+                                });
+
+                                // Merge video and audio using ffmpeg
+                                await new Promise((resolve, reject) => {
+                                    ffmpeg()
+                                        .input(tempVideoPath)
+                                        .input(tempAudioPath)
+                                        .outputOptions([
+                                            '-c:v copy',      // Copy video codec
+                                            '-c:a aac',       // Convert audio to AAC
+                                            '-strict experimental'
+                                        ])
+                                        .on('end', resolve)
+                                        .on('error', reject)
+                                        .save(mergedVideoPath);
+                                });
+
+                                // Send the merged video
+                                await ctx.reply('🎬 Sending merged video...');
+                                await ctx.replyWithVideo({ 
+                                    source: mergedVideoPath,
+                                    caption: `${videoTitle}\n\n@${ctx.from.username || ctx.from.id}`
+                                });
+
+                                // Clean up temporary files
+                                try {
+                                    fs.unlinkSync(tempVideoPath);
+                                    fs.unlinkSync(tempAudioPath);
+                                    fs.unlinkSync(mergedVideoPath);
+                                } catch (err) {
+                                    logger.error('Error cleaning up temporary files', err);
+                                }
+
+                                await ctx.reply('✅ Done!');
                             }
                         } catch (error) {
                             logger.error('Error processing video', error);
-                            await ctx.reply('❌ Failed to process video');
+                            await ctx.reply('❌ Failed to process video. Please try again.');
+                            
+                            // Clean up any temporary files that might exist
+                            const tempFiles = [
+                                path.join(__dirname, 'downloads', `${videoTitle}_temp_video.mp4`),
+                                path.join(__dirname, 'downloads', `${videoTitle}_temp_audio.mp3`),
+                                path.join(__dirname, 'downloads', `${videoTitle}_merged.mp4`)
+                            ];
+                            
+                            tempFiles.forEach(file => {
+                                if (fs.existsSync(file)) {
+                                    try {
+                                        fs.unlinkSync(file);
+                                    } catch (err) {
+                                        logger.error('Error cleaning up temporary file', err);
+                                    }
+                                }
+                            });
                         }
                     });
                 });
